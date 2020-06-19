@@ -3,7 +3,7 @@
 Plugin Name: PDF Forms Filler for Contact Form 7
 Plugin URI: https://github.com/maximum-software/wpcf7-pdf-forms
 Description: Create Contact Form 7 forms from PDF forms.  Get PDF forms filled automatically and attached to email messages and submission responses upon form submission on your website.  Embed images into PDF files.  Uses Pdf.Ninja API for working with PDF files.  See tutorial video for a demo.
-Version: 1.2.3
+Version: 1.2.4
 Author: Maximum.Software
 Author URI: https://maximum.software/
 Text Domain: pdf-forms-for-contact-form-7
@@ -17,7 +17,7 @@ if( ! class_exists( 'WPCF7_Pdf_Forms' ) )
 {
 	class WPCF7_Pdf_Forms
 	{
-		const VERSION = '1.2.3';
+		const VERSION = '1.2.4';
 		
 		private static $instance = null;
 		private $pdf_ninja_service = null;
@@ -25,7 +25,8 @@ if( ! class_exists( 'WPCF7_Pdf_Forms' ) )
 		private $registered_services = false;
 		private $downloads = null;
 		private $storage = null;
-		
+		private $cf7_forms_save_overrides = null;
+
 		private function __construct()
 		{
 			load_plugin_textdomain( 'pdf-forms-for-contact-form-7', false, dirname( plugin_basename( __FILE__ ) ) . '/languages' );
@@ -70,10 +71,12 @@ if( ! class_exists( 'WPCF7_Pdf_Forms' ) )
 			add_action( 'admin_menu', array( $this, 'register_services') );
 			
 			add_action( 'wpcf7_before_send_mail', array( $this, 'fill_and_attach_pdfs' ) );
-			add_action( 'wpcf7_after_create', array( $this, 'update_post_attachments' ) );
-			add_action( 'wpcf7_after_update', array( $this, 'update_post_attachments' ) );
+			add_action( 'wpcf7_after_save', array( $this, 'update_post_attachments' ) );
 			add_action( 'wpcf7_mail_sent', array( $this, 'change_response_message' ) );
 			
+			//Hook that allow to copy media and mapping
+			add_filter( 'wpcf7_copy', array( $this,'duplicate_form_hook' ),10,2 );
+
 			// TODO: allow users to run this manually
 			//$this->upgrade_data();
 		}
@@ -114,13 +117,16 @@ if( ! class_exists( 'WPCF7_Pdf_Forms' ) )
 			if( $options['action'] == 'update'
 			&& $options['type'] == 'plugin'
 			&& isset( $options['plugins'] ) )
+			{
 				foreach( $options['plugins'] as $plugin )
+				{
 					if( $plugin == $plugin_path )
 					{
 						set_transient( 'wpcf7_pdf_forms_updated_old_version', self::VERSION );
-						
 						break;
 					}
+				}
+			}
 		}
 		
 		/*
@@ -393,7 +399,7 @@ if( ! class_exists( 'WPCF7_Pdf_Forms' ) )
 				$copy_attachment_id = media_handle_sideload( array(
 					'tmp_name' => $temp_filepath,
 					'name'     => $copy_filename
-				) );
+				), $post_id);
 				if( is_wp_error( $copy_attachment_id ) )
 				{
 					@unlink( $temp_filepath );
@@ -465,17 +471,42 @@ if( ! class_exists( 'WPCF7_Pdf_Forms' ) )
 		}
 		
 		/**
+		 * Hook that runs on form copy/duplicate forms with the editor
+		 */
+		function duplicate_form_hook( $new, $instance )
+		{
+			$prev_post_id = $instance->id();
+			$attachments = $this->post_get_all_pdfs( $prev_post_id );
+			
+			$mappings = self::get_meta( $prev_post_id, 'mappings' );
+			if( $mappings )
+				$mappings = json_decode( $mappings, true );
+			if( !is_array( $mappings ) )
+				$mappings = array();
+			
+			$embeds = self::get_meta( $prev_post_id, 'embeds' );
+			if( $embeds )
+				$embeds = json_decode( $embeds, true );
+			if( !is_array( $embeds ) )
+				$embeds = array();
+			
+			$this->cf7_forms_save_overrides = array( 'attachments' => $attachments , 'mappings' => $mappings , 'embeds' => $embeds );
+			
+			return $new;
+		}
+
+		/**
 		 * Hook that runs on form save and attaches all PDFs that were attached to forms with the editor
 		 */
 		public function update_post_attachments( $contact_form )
 		{
 			$post_id = $contact_form->id();
-			
-			if( !isset( $_POST['wpcf7-pdf-forms-data'] ) )
-				return;
-			
-			$post_var = wp_unslash( $_POST['wpcf7-pdf-forms-data'] );
-			$data = json_decode( $post_var, true );
+
+			$data = null;
+			if( is_array( $this->cf7_forms_save_overrides ) )
+				$data = $this->cf7_forms_save_overrides;
+			else if( isset( $_POST['wpcf7-pdf-forms-data'] ) )
+				$data = json_decode( wp_unslash( $_POST['wpcf7-pdf-forms-data'] ), true );
 			
 			if( !is_array( $data ) )
 				return;
@@ -501,16 +532,22 @@ if( ! class_exists( 'WPCF7_Pdf_Forms' ) )
 								if( $attachment_id != $new_attachment_id )
 								{
 									// replace old attachment id in mappings
-									if( is_array( $data['mappings'] ) )
+									if( isset( $data['mappings'] ) && is_array( $data['mappings'] ) )
+									{
 										foreach( $data['mappings'] as &$mapping )
 											if( isset( $mapping['pdf_field'] ) )
 												$mapping['pdf_field'] = preg_replace( '/^' . preg_quote( $attachment_id . '-' ) . '/i', intval( $new_attachment_id ) . '-', $mapping['pdf_field'] );
+										unset($mapping);
+									}
 									
 									// replace old attachment id in embeds
-									if( is_array( $data['embeds'] ) )
+									if( isset( $data['embeds'] ) && is_array( $data['embeds'] ) )
+									{
 										foreach( $data['embeds'] as &$embed )
-											if( isset( $embed['attachment_id'] ) )
+											if( isset( $embed['attachment_id'] ) && $embed['attachment_id'] == $attachment_id )
 												$embed['attachment_id'] = $new_attachment_id;
+										unset($embed);
+									}
 									
 									// TODO: replace old attachment id in tag generator tool tags in the form body and settings
 									
@@ -534,10 +571,18 @@ if( ! class_exists( 'WPCF7_Pdf_Forms' ) )
 			if( isset( $data['mappings'] ) && is_array( $new_mappings = $data['mappings'] ) )
 			{
 				$mappings = array();
-				foreach( $new_mappings as $mapping )
-					if( isset( $mapping['cf7_field'] ) && isset( $mapping['pdf_field'] ) )
-						if( self::wpcf7_field_name_decode( $mapping['cf7_field'] ) === FALSE )
+				foreach( $new_mappings as $mapping ){
+					if( isset( $mapping['cf7_field'] ) && isset( $mapping['pdf_field'] ) ){
+						if( self::wpcf7_field_name_decode( $mapping['cf7_field'] ) === FALSE ){
 							$mappings[] = array( 'cf7_field' => $mapping['cf7_field'], 'pdf_field' => $mapping['pdf_field'] );
+						}
+					}		
+					if( isset( $mapping['mail_tags'] ) && isset( $mapping['pdf_field'] ) ){
+						if( self::wpcf7_field_name_decode( $mapping['mail_tags'] ) === FALSE ){
+							$mappings[] = array( 'mail_tags' => $mapping['mail_tags'], 'pdf_field' => $mapping['pdf_field'] );
+						}
+					}
+				}
 				self::set_meta( $post_id, 'mappings', self::json_encode( $mappings ) );
 			}
 			
@@ -863,6 +908,8 @@ if( ! class_exists( 'WPCF7_Pdf_Forms' ) )
 							
 							$element = $new_element;
 						}
+						unset($element);
+						
 						$save_directory = implode( "/", $path_elements );
 						$save_directory = preg_replace( '|/+|', '/', $save_directory ); // remove double slashes
 						
@@ -1021,7 +1068,12 @@ if( ! class_exists( 'WPCF7_Pdf_Forms' ) )
 		public static function json_encode( $value )
 		{
 			if( version_compare( phpversion(), "5.4" ) < 0 )
-				return preg_replace( "/\\\\u([a-f0-9]{4})/e", "iconv('UCS-4LE','UTF-8',pack('V', hexdec('U$1')))", json_encode( $value ) );
+				return preg_replace(
+						"/\\\\u([a-f0-9]{4})/" .
+						"e", // don't warn me about this, I know!
+						"iconv('UCS-4LE','UTF-8',pack('V', hexdec('U$1')))",
+						json_encode( $value )
+					);
 			
 			return json_encode( $value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
 		}
@@ -1069,7 +1121,7 @@ if( ! class_exists( 'WPCF7_Pdf_Forms' ) )
 						// add pipe to prevent user confusion with singular options
 						$tagValues .= '"' . esc_attr( strval( $field['name'] ) ) . '|' . esc_attr( strval( reset( $options ) ) ) . '" ';
 					else
-						foreach( $options as &$option )
+						foreach( $options as $option )
 							$tagValues .= '"' . esc_attr( strval( $option ) ) . '" ';
 					
 					if( $type == 'checkbox' && count( $options ) > 1 )
@@ -1139,7 +1191,7 @@ if( ! class_exists( 'WPCF7_Pdf_Forms' ) )
 					$tags = "";
 					
 					foreach ( $fields as $attachment_id => $fs )
-						foreach ( $fs as &$field )
+						foreach ( $fs as $field )
 						{
 							if( isset( $field['type'] ) )
 							{
